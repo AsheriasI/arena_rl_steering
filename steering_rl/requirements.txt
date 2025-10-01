@@ -1,0 +1,9 @@
+torch>=2.2
+transformers>=4.43
+accelerate>=0.33
+datasets>=2.20
+einops>=0.8
+tqdm>=4.66
+wandb>=0.17
+numpy>=1.26
+requests>=2.32
