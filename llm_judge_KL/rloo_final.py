@@ -26,7 +26,7 @@ from transformer_lens.hook_points import HookPoint
 from transformers import AutoTokenizer
 
 # ============== GPU / Accelerate ==============
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from accelerate import Accelerator
 
@@ -51,7 +51,7 @@ BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # actor (TransformerLens)
 
 # Use OpenRouter instead of your local vLLM
 JUDGE_BASE_URL = "https://openrouter.ai/api/v1"
-JUDGE_MODEL = "openai/gpt-5"  # or whatever exact ID your account has access to
+JUDGE_MODEL = "openai/gpt-5-mini"  # or whatever exact ID your account has access to
 
 
 # ============== JSON Judge Prompt (rate sycophancy) ==============
@@ -167,6 +167,8 @@ Keep your notes close. Map the star-blinks at the same time each night. When the
 @dataclass
 class RLHFArgs:
     seed: int = 1
+
+    dtype: t.dtype = t.bfloat16
 
     # logging
     use_wandb: bool = False
@@ -470,11 +472,15 @@ class RLHFTrainer:
 
         self.model = HookedTransformerWithSteering.from_pretrained(
             args.base_model,
-        ).to(device).train()
+            dtype=self.args.dtype,
+            device=device,
+        ).train()
 
         self.ref_model = HookedTransformer.from_pretrained(
             args.base_model,
-        ).to(device).eval()
+            dtype=self.args.dtype,
+            device=device,
+        ).eval()
 
         self.optimizer, self.scheduler = get_optimizer_and_scheduler(self.args, self.model)
         self.model, self.optimizer, self.scheduler = accelerator.prepare(self.model, self.optimizer, self.scheduler)
@@ -679,7 +685,7 @@ def load_prompts(prompts_path: Optional[str], prompts_inline: Optional[list[str]
 @dataclass
 class RLOOArgs(RLHFArgs):
     steering_layer_indices: list[int] = None
-    steering_init_scale: float = 0.2
+    steering_init_scale: float = 1
 
     judge_system_prompt_path: str = "judge_prompt.txt"  # legacy; not used
     judge_concurrency: int = 32
@@ -745,15 +751,19 @@ class RLOOTrainer(RLHFTrainer):
         # actor with steering
         self.model = HookedTransformerWithSteering.from_pretrained(
             args.base_model,
+            dtype=self.args.dtype,
+            device=device,
             layer_indices=args.steering_layer_indices,
             init_scale=args.steering_init_scale,
-        ).to(device).train()
+        ).train()
 
         # self.ref_model = self.model
         # Frozen reference model (no steering, no grads)
         self.ref_model = HookedTransformer.from_pretrained(
             args.base_model,
-        ).to(device).eval()
+            dtype=self.args.dtype,
+            device=device,
+        ).eval()
         for p in self.ref_model.parameters():
             p.requires_grad_(False)
 
@@ -915,7 +925,7 @@ class RLOOTrainer(RLHFTrainer):
                 wb = {f"steering/{k}": v for k, v in metrics.items()}
                 wb["phase"] = phase_idx
                 wandb.log(wb)
-            if save_snapshot and self.phase % 10 == 0:
+            if save_snapshot and self.phase % 5 == 0:
                 self._save_steering_snapshot(phase_idx)
     
     def rollout_phase(self):
@@ -967,7 +977,7 @@ class RLOOTrainer(RLHFTrainer):
                 assistant_replies=all_continuations,
             )
         )
-        syco = t.tensor(syco_scores, dtype=t.float32, device=device)
+        syco = t.tensor(syco_scores, dtype=self.args.dtype, device=device)
         syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         rewards = syco  # [B*K]
 
@@ -1193,7 +1203,7 @@ class RLOOTrainer(RLHFTrainer):
                 assistant_replies=continuations,
             )
         )
-        syco = t.tensor(syco_scores, dtype=t.float32, device=device)
+        syco = t.tensor(syco_scores, dtype=self.args.dtype, device=device)
         syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         rewards = syco
 
@@ -1358,7 +1368,7 @@ class RLOOTrainer(RLHFTrainer):
             )
             
             # Convert to tensor and sanitize
-            syco = t.tensor(syco_scores, dtype=t.float32, device=device)
+            syco = t.tensor(syco_scores, dtype=self.args.dtype, device=device)
             syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
             rewards = syco
             
@@ -1546,7 +1556,7 @@ if __name__ == "__main__":
 
     rloo_args = RLOOArgs(
         use_wandb=False,
-        total_phases=15,
+        total_phases=50,
 
         # batch = number of prompts
         batch_size=len(formatted_prompts),  # must equal number of prompts
@@ -1559,7 +1569,7 @@ if __name__ == "__main__":
         prepend_bos=False,
 
         steering_layer_indices=None,        # all layers
-        steering_init_scale=0.2,
+        steering_init_scale=1,
 
         # Actor vs judge prompts
         actor_prompts_inline=formatted_prompts,
