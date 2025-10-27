@@ -23,7 +23,6 @@ from torch import Tensor
 
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
-from transformers import AutoTokenizer
 
 # ============== GPU / Accelerate ==============
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
@@ -42,12 +41,7 @@ accelerator = Accelerator(
 device = accelerator.device
 
 # ============== Models & Judge ==============
-# BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # actor (TransformerLens)
-# JUDGE_BASE_URL = "http://localhost:8000/v1"       # vLLM server URL
-# JUDGE_MODEL = "cognitivecomputations/dolphin-mistral-24b-venice-edition"
-
-# ============== Models & Judge ==============
-BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # actor (TransformerLens)
+BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"    # actor (TransformerLens)
 
 # Use OpenRouter instead of your local vLLM
 JUDGE_BASE_URL = "https://openrouter.ai/api/v1"
@@ -292,7 +286,7 @@ class HookedTransformerWithSteering(HookedTransformer):
 
     @t.no_grad()
     def generate(self, tokens: Int[Tensor, "batch seq"], **kwargs) -> Int[Tensor, "batch seq"]:
-        with self.hooks(fwd_hooks=self.steering_fwd_hooks):
+        with self.hooks(fwd_hooks=self.fwd_hooks):
             gen_tokens = super().generate(tokens, **kwargs)
         return gen_tokens
 
@@ -326,11 +320,39 @@ def get_logprobs(
     tokens: Int[Tensor, "batch seq_len"],
     prefix_len: int | None = None,
 ) -> Float[Tensor, "batch gen_len"]:
+    """
+    Calculates the logprobs for the *generated* tokens.
+    - logits[b, i] is the distribution for tokens[b, i+1]
+    
+    [FIXED (Comment 8)]
+    """
+    
     if prefix_len is not None:
-        logits = logits[:, prefix_len - 1:]
-        tokens = tokens[:, prefix_len - 1:]
-    logprobs = logits.log_softmax(-1)
-    correct_logprobs = eindex(logprobs, tokens, "b s [b s+1]")
+        # We want to score the generated tokens, which start at index `prefix_len`.
+        # The logits for the *first* generated token (at index `prefix_len`)
+        # come from the *last* prompt token (at index `prefix_len - 1`).
+        
+        # Logits from the end of the prompt to the second-to-last token
+        # Shape: [B, gen_len, V]
+        logits_to_use = logits[:, prefix_len - 1 : -1]
+        
+        # Generated tokens (the ones we want to score)
+        # Shape: [B, gen_len]
+        tokens_to_predict = tokens[:, prefix_len:]
+    
+    else:
+        # No prefix, score all tokens except the first one
+        logits_to_use = logits[:, :-1]
+        tokens_to_predict = tokens[:, 1:]
+
+    assert logits_to_use.shape[1] == tokens_to_predict.shape[1], \
+        f"Logits and tokens shape mismatch: {logits_to_use.shape[1]} vs {tokens_to_predict.shape[1]}"
+
+    logprobs = logits_to_use.log_softmax(-1)
+    
+    # We want logprobs[b, s, tokens_to_predict[b, s]]
+    correct_logprobs = eindex(logprobs, tokens_to_predict, "b s [b s]")
+    
     return correct_logprobs
 
 def get_optimizer(model: HookedTransformerWithSteering, base_lr: float, head_lr: float) -> t.optim.Optimizer:
@@ -356,7 +378,10 @@ def get_optimizer_and_scheduler(args: RLHFArgs, model: HookedTransformerWithStee
 # Judges
 # =========================
 class LocalVLLMJSONJudge:
-    """Calls /v1/chat/completions to get {"sycophancy": float, "explanation": "..."}."""
+    """
+    Calls /v1/chat/completions to get {"sycophancy": float, "explanation": "..."}.
+    [FIXED (Comment 2)] Now uses a persistent client and includes retries.
+    """
     def __init__(self, base_url=JUDGE_BASE_URL, model=JUDGE_MODEL, concurrency: int = 32, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -371,11 +396,23 @@ class LocalVLLMJSONJudge:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             # Optional (helps with routing/usage analytics):
-            # "HTTP-Referer": "http://localhost",   # or your site/app URL
+            # "HTTP-Referer": "http://localhost",    # or your site/app URL
             # "X-Title": "sycophancy-judge",
         }
+        
+        # [FIX (Comment 2)] Create a persistent client
+        self.client = httpx.AsyncClient(timeout=self.timeout)
+
+    async def aclose(self):
+        """Closes the httpx client."""
+        if accelerator.is_main_process:
+            print("[judge] Closing HTTP client...")
+        await self.client.aclose()
 
     async def _score_one(self, client: httpx.AsyncClient, system_prompt: str, user_msg: str, assistant_msg: str) -> float:
+        """
+        [FIXED (Comment 2)] Added retry logic for network/judge errors.
+        """
         body = {
             "model": self.model,
             "temperature": 0.0,
@@ -386,75 +423,58 @@ class LocalVLLMJSONJudge:
                 {"role": "user", "content": f"User:\n{user_msg}\n\nAssistant:\n{assistant_msg}"},
             ]
         }
-        # async with self.semaphore:
-        #     try:
-        #         r = await client.post(f"{self.base_url}/chat/completions", headers=self.headers, json=body)
-        #         r.raise_for_status()
-        #         data = r.json()
-
-
-
-
-        #         txt = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-        #         m = re.search(r"\{.*\}", txt, re.DOTALL)
-        #         if not m:
-        #             return 0.0
-        #         obj = json.loads(m.group(0))
-        #         s = float(obj.get("sycophancy", 0.0))
-        #         if not math.isfinite(s):
-        #             return 0.0
-        #         return max(0.0, min(1.0, s))
-        #     except Exception as e:
-        #         print(f"[json-judge] error: {e}")
-        #         return 0.0
-
-        async with self.semaphore:
+        
+        # [FIX (Comment 2)] Add retry logic
+        for attempt in range(3): # Try 3 times
             try:
-                r = await client.post(f"{self.base_url}/chat/completions", headers=self.headers, json=body)
-                r.raise_for_status()
-                data = r.json()
+                async with self.semaphore:
+                    r = await client.post(f"{self.base_url}/chat/completions", headers=self.headers, json=body)
+                    r.raise_for_status()
+                    data = r.json()
 
                 # --- DEBUG: show raw completion text ---
                 txt = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
                 raw = txt.strip()
-                # print("[json-judge][raw]", raw[:500].replace("\n", "\\n"))  # trim to keep logs manageable
-
+                
                 # Try to extract JSON
                 m = re.search(r"\{.*\}", raw, re.DOTALL)
                 if not m:
-                    print("[json-judge][warn] No JSON object found in completion. Full text above.")
-                    return 0.0
+                    print(f"[json-judge][warn] No JSON found, attempt {attempt+1}/3. Retrying... Raw: {raw[:100]}")
+                    await asyncio.sleep(1.0 * (attempt + 1)) # Exponential backoff
+                    continue # Go to next attempt
 
                 obj = json.loads(m.group(0))
-                # print("[json-judge][parsed]", obj)  # --- DEBUG: parsed dict ---
-
                 s = float(obj.get("sycophancy", 0.0))
+                
                 if not math.isfinite(s):
-                    print("[json-judge][warn] Non-finite sycophancy:", s)
-                    return 0.0
-                return max(0.0, min(1.0, s))
+                    print(f"[json-judge][warn] Non-finite score {s}, attempt {attempt+1}/3. Retrying...")
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue # Go to next attempt
+
+                return max(0.0, min(1.0, s)) # Success!
 
             except httpx.HTTPStatusError as e:
-                # --- DEBUG: HTTP errors & body ---
-                print(f"[json-judge][http-error] {e} | status={getattr(e.response,'status_code',None)}")
-                try:
-                    # print("[json-judge][body]", e.response.text[:1000])
-                    pass
-                except Exception:
-                    pass
-                return 0.0
+                print(f"[json-judge][http-error] {e} (attempt {attempt+1}/3). Retrying...")
+                await asyncio.sleep(1.0 * (attempt + 1))
             except Exception as e:
-                print(f"[json-judge][error] {e}")
-                return 0.0
+                print(f"[json-judge][error] {e} (attempt {attempt+1}/3). Retrying...")
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+        print(f"[json-judge][error] All retries failed for prompt: {user_msg[:50]}... Returning 0.0 as fallback.")
+        return 0.0 # Fallback after all retries fail
+
 
     async def score_batch_syco(self, system_prompt: str, user_prompts: list[str], assistant_replies: list[str]) -> list[float]:
+        """
+        [FIXED (Comment 2)] Uses the persistent self.client.
+        """
         assert len(user_prompts) == len(assistant_replies)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            tasks = [
-                self._score_one(client, system_prompt, user_prompts[i], assistant_replies[i])
-                for i in range(len(user_prompts))
-            ]
-            return await asyncio.gather(*tasks)
+        # [FIX (Comment 2)] Use self.client instead of creating a new one
+        tasks = [
+            self._score_one(self.client, system_prompt, user_prompts[i], assistant_replies[i])
+            for i in range(len(user_prompts))
+        ]
+        return await asyncio.gather(*tasks)
 
 # =========================
 # Trainers
@@ -480,6 +500,15 @@ class RLHFTrainer:
         self.model, self.optimizer, self.scheduler = accelerator.prepare(self.model, self.optimizer, self.scheduler)
 
         self.prefix_len = len(self.model.to_str_tokens(self.args.prefix, prepend_bos=self.args.prepend_bos))
+        
+        # [FIX (Comment 6)] Cache steering parameters
+        self.steering_param_list = [
+            p for name, p in self.model.named_parameters() 
+            if "steering_hooks" in name and p.requires_grad
+        ]
+        if accelerator.is_main_process:
+             print(f"[init] Caching {len(self.steering_param_list)} steering parameters for sanitization.")
+
 
     def compute_rlhf_objective(self, minibatch):
         raise NotImplementedError
@@ -488,9 +517,17 @@ class RLHFTrainer:
         loss_val = 0.0
         minibatches = memory.get_minibatches()
 
+        # collect metrics to average across minibatches
+        mb_kl = []
+        mb_ent = []
+        mb_act_lp = []
+        mb_ref_lp = []
+        last_ent_coef_used = None
+        last_kl_coef_used = None
+
         for minibatch in minibatches:
             self.optimizer.zero_grad()
-            total_objective = self.compute_rlhf_objective(minibatch)
+            total_objective, mb_metrics = self.compute_rlhf_objective(minibatch)
 
             # --- Non-finite guard ---
             if not t.isfinite(total_objective):
@@ -503,31 +540,63 @@ class RLHFTrainer:
 
             if accelerator.is_main_process and (self.step % 50 == 0):
                 gstats = []
-                for name, p in self.model.named_parameters():
-                    if "steering_hooks" in name and p.grad is not None and t.isfinite(p.grad).all():
-                        gstats.append((name, float(p.grad.norm().item())))
-                gstats.sort(key=lambda x: x[0])
-                head = [(n, round(g, 6)) for n, g in gstats[:5]]
-                print(f"[steering::grads] norms (first 5): {head}")
+                # [FIX (Comment 6)] Use cached list
+                for p in self.steering_param_list:
+                    if p.grad is not None and t.isfinite(p.grad).all():
+                        gstats.append(float(p.grad.norm().item()))
+                
+                if gstats:
+                    print(f"[steering::grads] norms (mean): {sum(gstats)/len(gstats):.6f}")
 
             accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
             self.optimizer.step()
 
             # --- Parameter sanitization: kill NaN/Inf & clamp steering vectors ---
+            # [FIXED (Comment 6)] Optimized loop
             with t.no_grad():
-                for name, p in self.model.named_parameters():
-                    if "steering_hooks" in name:
-                        mask = ~t.isfinite(p)
-                        if mask.any():
-                            p[mask] = 0.0
-                        p.clamp_(min=-5.0, max=5.0)
+                for p in self.steering_param_list: # Use the cached list
+                    mask = ~t.isfinite(p)
+                    if mask.any():
+                        p[mask] = 0.0
+                    p.clamp_(min=-5.0, max=5.0)
 
             self.step += 1
             loss_val += float(total_objective.item())
 
-        loss_val /= max(1, len(minibatches))
+            # collect
+            mb_kl.append(mb_metrics["kl_per_token"])
+            mb_ent.append(mb_metrics["entropy_per_token"])
+            mb_act_lp.append(mb_metrics["actor_logprob_per_token"])
+            mb_ref_lp.append(mb_metrics["ref_logprob_per_token"])
+            last_ent_coef_used = mb_metrics["ent_coef_used"]
+            last_kl_coef_used = mb_metrics["kl_coef_used"]
+
+        # average
+        n = max(1, len(minibatches))
+        loss_val /= n
+        mean_kl = float(sum(mb_kl)/n) if mb_kl else float('nan')
+        mean_ent = float(sum(mb_ent)/n) if mb_ent else float('nan')
+        mean_act_lp = float(sum(mb_act_lp)/n) if mb_act_lp else float('nan')
+        mean_ref_lp = float(sum(mb_ref_lp)/n) if mb_ref_lp else float('nan')
+
+        # step scheduler
         self.scheduler.step()
+
+        # ===== Adaptive KL update (uses averaged KL for this phase step) =====
+        if math.isfinite(mean_kl):
+            self._maybe_update_kl_coef(mean_kl)
+
+        # Stash for train() logging
+        self._last_train_metrics = {
+            "mean_kl_per_token": mean_kl,
+            "mean_entropy_per_token": mean_ent,
+            "mean_actor_logprob_per_token": mean_act_lp,
+            "mean_ref_logprob_per_token": mean_ref_lp,
+            "kl_coef_used": float(self.args.kl_coef),
+            "ent_coef_used": float(last_ent_coef_used if last_ent_coef_used is not None else self._current_ent_coef(self.phase)),
+        }
         return loss_val
+
 
     def train(self):
         self.step = 0
@@ -550,51 +619,6 @@ class RLHFTrainer:
 
         if self.args.use_wandb and accelerator.is_main_process:
             wandb.finish()
-
-# # ---- Replay storage ----
-# @dataclass
-# class ReplayMinibatch:
-#     sample_ids: Int[Tensor, " minibatch_size seq_len"]
-#     logprobs: Float[Tensor, " minibatch_size gen_len"]
-#     advantages: Float[Tensor, " minibatch_size gen_len"]
-#     returns: Float[Tensor, " minibatch_size gen_len"]  # unused
-#     ref_logits: Float[Tensor, " minibatch_size seq_len d_vocab"]  # unused
-
-# class ReplayMemory:
-#     def __init__(
-#         self,
-#         args: RLHFArgs,
-#         sample_ids: Int[Tensor, " batch_size seq_len"],
-#         logprobs: Float[Tensor, " batch_size gen_len"],
-#         advantages: Float[Tensor, " batch_size gen_len"],
-#         values: Float[Tensor, " batch_size seq_len"],
-#         ref_logits: Float[Tensor, " batch_size seq_len d_vocab"],
-#     ):
-#         assert sample_ids.shape[0] == args.batch_size
-#         assert logprobs.shape == (args.batch_size, args.gen_len)
-#         assert advantages.shape == (args.batch_size, args.gen_len)
-#         self.args = args
-#         self.sample_ids = sample_ids
-#         self.logprobs = logprobs
-#         self.advantages = advantages
-#         self.values = values
-#         self.ref_logits = ref_logits
-
-#     def get_minibatches(self) -> list[ReplayMinibatch]:
-#         minibatches = []
-#         returns = self.advantages
-#         for _ in range(self.args.batches_per_learning_phase):
-#             for idx in t.randperm(self.args.batch_size).reshape(self.args.num_minibatches, -1):
-#                 minibatches.append(
-#                     ReplayMinibatch(
-#                         sample_ids=self.sample_ids[idx],
-#                         logprobs=self.logprobs[idx],
-#                         advantages=self.advantages[idx],
-#                         returns=returns[idx],
-#                         ref_logits=self.ref_logits[idx],
-#                     )
-#                 )
-#         return minibatches
 
 # ---- Replay storage ----
 @dataclass
@@ -629,26 +653,6 @@ class ReplayMemory:
 
 
 # Helper: concatenate memories (for multiple rollouts per phase)
-# def _cat_memories(memories: list['ReplayMemory']) -> 'ReplayMemory':
-#     assert len(memories) > 0
-#     args0 = memories[0].args
-#     sample_ids = t.cat([m.sample_ids for m in memories], dim=0)
-#     logprobs   = t.cat([m.logprobs   for m in memories], dim=0)
-#     advantages = t.cat([m.advantages for m in memories], dim=0)
-#     values     = t.cat([m.values     for m in memories], dim=0)
-#     ref_logits = t.cat([m.ref_logits for m in memories], dim=0)
-
-#     new_args = dataclasses.replace(args0, batch_size=sample_ids.shape[0])
-#     new_args.minibatch_size = new_args.batch_size // new_args.num_minibatches
-#     return ReplayMemory(
-#         args=new_args,
-#         sample_ids=sample_ids,
-#         logprobs=logprobs,
-#         advantages=advantages,
-#         values=values,
-#         ref_logits=ref_logits,
-#     )
-
 def _cat_memories(memories: list['ReplayMemory']) -> 'ReplayMemory':
     assert len(memories) > 0
     args0 = memories[0].args
@@ -698,15 +702,24 @@ class RLOOArgs(RLHFArgs):
     plot_steering_after_training: bool = True
     steering_plot_png: Optional[str] = None
 
-    # KL disabled
-    kl_beta: float = 0.0
-    kl_beta_final: Optional[float] = None
-    kl_beta_anneal: Optional[str] = None
-
     # ===== Training metrics & multi-rollout =====
     train_metrics_csv: str = "training_metrics.csv"
     plot_train_png: Optional[str] = None
     rollouts_per_phase: int = 1  # <-- collect this many fresh rollouts each phase
+
+    # ===== New: Adaptive KL controls =====
+    use_adaptive_kl: bool = True
+    kl_target_nats: float = 0.05       # target KL/token
+    kl_coef_min: float = 0.05
+    kl_coef_max: float = 3.0
+    kl_up: float = 1.05             # multiplicative up/down
+    kl_down: float = 0.97
+
+    # ===== New: Entropy anneal controls =====
+    use_entropy_anneal: bool = True
+    ent_coef_start: float = 0.005    # overrides RLHFArgs.ent_coef if anneal is on
+    ent_coef_end: float = 0.0
+    ent_warmup_phases: int = 2
 
 class RLOOTrainer(RLHFTrainer):
     @staticmethod
@@ -749,7 +762,6 @@ class RLOOTrainer(RLHFTrainer):
             init_scale=args.steering_init_scale,
         ).to(device).train()
 
-        # self.ref_model = self.model
         # Frozen reference model (no steering, no grads)
         self.ref_model = HookedTransformer.from_pretrained(
             args.base_model,
@@ -760,6 +772,14 @@ class RLOOTrainer(RLHFTrainer):
 
         self.optimizer, self.scheduler = get_optimizer_and_scheduler(self.args, self.model)
         self.model, self.optimizer, self.scheduler = accelerator.prepare(self.model, self.optimizer, self.scheduler)
+        
+        # [FIX (Comment 6)] Cache steering parameters *after* prepare
+        self.steering_param_list = [
+            p for name, p in self.model.named_parameters() 
+            if "steering_hooks" in name and p.requires_grad
+        ]
+        if accelerator.is_main_process:
+             print(f"[init] Caching {len(self.steering_param_list)} steering parameters for sanitization.")
 
         self.prefix_len = len(self.model.to_str_tokens(self.args.prefix, prepend_bos=self.args.prepend_bos))
 
@@ -821,8 +841,16 @@ class RLOOTrainer(RLHFTrainer):
         if accelerator.is_main_process and (not os.path.exists(self.args.train_metrics_csv) or os.path.getsize(self.args.train_metrics_csv) == 0):
             with open(self.args.train_metrics_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                # sycophancy-only reward
-                w.writerow(["phase", "mean_sycophancy", "std_sycophancy", "mean_reward", "std_reward", "num_rollouts", "batch_size_per_rollout"])
+                # Add KL/token, Entropy/token, and the coefficients used this phase
+                w.writerow([
+                    "phase",
+                    "mean_sycophancy", "std_sycophancy",
+                    "mean_reward", "std_reward",
+                    "mean_kl_per_token", "mean_entropy_per_token",
+                    "kl_coef_used", "ent_coef_used",
+                    "num_rollouts", "batch_size_per_rollout"
+                ])
+
 
         # initial logs & metrics
         self._log_steering_param_stats(tag="init")
@@ -918,8 +946,30 @@ class RLOOTrainer(RLHFTrainer):
             if save_snapshot and self.phase % 10 == 0:
                 self._save_steering_snapshot(phase_idx)
     
+    def _current_ent_coef(self, phase_idx: int) -> float:
+        """Return entropy coefficient for this phase (annealed or fixed)."""
+        if getattr(self.args, "use_entropy_anneal", False):
+            tfrac = min(1.0, max(0.0, phase_idx / max(1, self.args.ent_warmup_phases)))
+            return (1.0 - tfrac) * self.args.ent_coef_start + tfrac * self.args.ent_coef_end
+        else:
+            # fall back to whatever is in RLHFArgs.ent_coef
+            return self.args.ent_coef
+
+    def _maybe_update_kl_coef(self, observed_kl_per_token: float):
+        """Simple proportional controller for KL coefficient."""
+        if not getattr(self.args, "use_adaptive_kl", False):
+            return
+        target = self.args.kl_target_nats
+        if observed_kl_per_token > target:
+            self.args.kl_coef = min(self.args.kl_coef * self.args.kl_up, self.args.kl_coef_max)
+        else:
+            self.args.kl_coef = max(self.args.kl_coef * self.args.kl_down, self.args.kl_coef_min)
+
+
     def rollout_phase(self):
         """
+        [FIXED (Comment 0)] This is the correct, active RLOO implementation.
+        
         Multi-rollout phase:
         - For each prompt, generate K continuations (K = rollouts_per_phase)
         - Judge all continuations at once
@@ -927,7 +977,7 @@ class RLOOTrainer(RLHFTrainer):
         - Broadcast per-sequence advantages across generated tokens
         """
         K = max(1, int(self.args.rollouts_per_phase))  # K samples per prompt
-        B = len(self.actor_prompts)                   # number of distinct prompts
+        B = len(self.actor_prompts)                     # number of distinct prompts
         if accelerator.is_main_process:
             print(f"\n[phase {self.phase}] generating {K} samples per prompt (total {B*K})...")
 
@@ -945,9 +995,11 @@ class RLOOTrainer(RLHFTrainer):
                 prepend_bos=self.args.prepend_bos,
             )
             gen_only = sample_ids[:, -self.args.gen_len:]
-            continuations = [self.model.to_string(row.unsqueeze(0))[0] for row in gen_only]
+            
+            # [FIX (Comment 1)] Use batched to_string
+            continuations = self.model.to_string(gen_only)
 
-            all_sample_ids.append(sample_ids.detach())
+            all_sample_ids.append(sample_ids)
             all_continuations.extend(continuations)
 
             if accelerator.is_main_process and k == 0:
@@ -976,14 +1028,20 @@ class RLOOTrainer(RLHFTrainer):
             print("[judge] rewards (first 5):", [round(float(r), 3) for r in rewards[:5]])
 
         # === Step 3: per-prompt RLOO + std-norm ===
-        rewards = rewards.view(K, B).T  # [B, K]
+        # This is the CORRECT RLOO baseline calculation
+        rewards_per_prompt = rewards.view(B, K)  # [B, K]
         # per prompt leave-one-out baseline:
-        sum_r = rewards.sum(dim=1, keepdim=True)
-        loo_baseline = (sum_r - rewards) / rewards.clamp_min(1e-6).shape[1]-1
-        advantages_seq = rewards - loo_baseline  # [B, K]
-        # per-prompt std norm:
-        adv_std = advantages_seq.std(dim=1, keepdim=True).clamp_min(1e-6)
-        advantages_seq = advantages_seq / adv_std
+        sum_r = rewards_per_prompt.sum(dim=1, keepdim=True)
+        K_f = rewards_per_prompt.shape[1]
+        
+        # Ensure K_f-1 is not zero if K=1
+        loo_baseline = (sum_r - rewards_per_prompt) / max(1, K_f - 1) 
+        
+        advantages_seq = rewards_per_prompt - loo_baseline  # [B, K]
+        
+        # per-prompt std norm BUT NEEDS NORMALISING ACROSS ALL ADV:
+        global_adv_std = advantages_seq.std().clamp_min(1e-6) # [scalar]
+        advantages_seq = advantages_seq / global_adv_std
 
         # broadcast to tokens:
         advantages = einops.repeat(
@@ -991,7 +1049,7 @@ class RLOOTrainer(RLHFTrainer):
         )  # [B*K, G]
 
         # reshape sample_ids back to [B*K, S]:
-        sample_ids_flat = all_sample_ids  # already flattened
+        sample_ids_flat = all_sample_ids.detach().clone()  # already flattened
 
         # === Step 4: pack memory ===
         new_args = dataclasses.replace(self.args, batch_size=sample_ids_flat.shape[0])
@@ -1000,7 +1058,9 @@ class RLOOTrainer(RLHFTrainer):
 
         # metrics:
         self._last_mean_syco = float(syco.mean().item())
-        self._last_mean_reward = float(rewards.mean().item())
+        self._last_std_syco = float(syco.std().item()) # Stash for logging
+        self._last_mean_reward = float(rewards_per_prompt.mean().item())
+        self._last_std_reward = float(rewards_per_prompt.std().item()) # Stash for logging
 
         # CSV logging:
         if accelerator.is_main_process:
@@ -1019,292 +1079,79 @@ class RLOOTrainer(RLHFTrainer):
                                     float(syco[idx].item())])
             print(f"[phase {self.phase}] wrote rollout data -> {self.args.csv_path}")
 
-        del all_sample_ids, all_continuations, syco, rewards
+        del all_sample_ids, all_continuations, syco, rewards, rewards_per_prompt
         t.cuda.empty_cache()
         return memory
 
 
 
     # ---------- Training objective / rollout ----------
-    # def compute_rlhf_objective(self, minibatch: ReplayMinibatch):
-    #     logits = self.model.forward_with_steering(minibatch.sample_ids)   # [B, S, V]
-    #     logprobs = get_logprobs(logits, minibatch.sample_ids, prefix_len=None)  # [B, S]
-    #     logprobs_gen = logprobs[:, -self.args.gen_len:]                     # [B, G]
-    #     advantages = minibatch.advantages[:, -self.args.gen_len:]           # [B, G]
-
-    #     # --- Stable entropy on generated tokens: H = -sum p * logp
-    #     logp = logits.log_softmax(-1)                                       # [B, S, V]
-    #     p = logp.exp()                                                      # [B, S, V]
-    #     H = -(p * logp).sum(dim=-1)                                         # [B, S]
-    #     ent_gen = H[:, -self.args.gen_len:].mean()                          # scalar
-
-    #     # REINFORCE with entropy bonus (maximize=True)
-    #     rloo_obj = (advantages * logprobs_gen).sum(dim=-1).mean()
-    #     rloo_obj = rloo_obj + self.args.ent_coef * ent_gen
-
-    #     del logits
-    #     return rloo_obj
-
     def compute_rlhf_objective(self, minibatch: ReplayMinibatch):
         """
         RL objective:
         E[ A * log pi ] + ent_coef * H - kl_coef * KL,
-        where all terms are averaged per token (length invariant).
+        all terms averaged per token over generated slice.
+        Returns: (objective, metrics_dict)
         """
         B, S = minibatch.sample_ids.shape
         G = self.args.gen_len
+        
+        # [FIX (Comment 8)] We need prefix_len to call get_logprobs correctly
+        prefix_len = S - G
+        assert prefix_len > 0, "Prefix length must be > 0"
 
+        # Forward actor + ref
         logits_actor = self.model.forward_with_steering(minibatch.sample_ids)  # [B,S,V]
         with t.no_grad():
             logits_ref = self.ref_model(minibatch.sample_ids)                  # [B,S,V]
 
-        # logprobs on actor:
-        logprobs_actor = get_logprobs(logits_actor, minibatch.sample_ids)      # [B,S]
-        logprobs_gen = logprobs_actor[:, -G:]                                  # [B,G]
-        advantages = minibatch.advantages[:, -G:]                              # [B,G]
+        # Token logprobs
+        # [FIX (Comment 8)] Pass prefix_len to get correct slice
+        logprobs_gen     = get_logprobs(logits_actor, minibatch.sample_ids, prefix_len=prefix_len) # [B,G]
+        ref_logprobs_gen = get_logprobs(logits_ref,   minibatch.sample_ids, prefix_len=prefix_len) # [B,G]
+        advantages       = minibatch.advantages[:, -G:]                                            # [B,G]
 
-        # === entropy bonus (per-token) ===
-        logp_actor = logits_actor.log_softmax(-1)  # [B,S,V]
-        p_actor = logp_actor.exp()
-        H_t = -(p_actor * logp_actor).sum(dim=-1)  # [B,S]
-        ent_gen = H_t[:, -G:].mean()               # scalar mean over all tokens in batch
+        # Per-token entropy (actor)
+        logp_actor = logits_actor.log_softmax(-1)     # [B,S,V]
+        p_actor    = logp_actor.exp()                 # [B,S,V]
+        H_tok      = -(p_actor * logp_actor).sum(dim=-1)     # [B,S]
+        ent_gen    = H_tok[:, -G:].mean()             # scalar
 
-        # === KL penalty KL(P_actor||P_ref) per token ===
-        logp_ref = logits_ref.log_softmax(-1)      # [B,S,V]
-        kl_t = (p_actor * (logp_actor - logp_ref)).sum(dim=-1)  # [B,S]
-        kl_gen = kl_t[:, -G:].mean()               # mean per token
+        # Per-token KL(actor||ref)
+        logp_ref = logits_ref.log_softmax(-1)         # [B,S,V]
+        kl_tok   = (p_actor * (logp_actor - logp_ref)).sum(dim=-1)  # [B,S]
+        kl_gen_tok = kl_tok[:, -G:]
+        kl_gen = t.nan_to_num(kl_gen_tok, nan=0.0, posinf=1.0, neginf=0.0).mean()
 
-        # === policy term ===
-        policy_obj = (advantages * logprobs_gen).sum(dim=-1).mean()  # per seq then mean
+        # Policy term (sequence mean of token-sum)
+        policy_obj = (advantages * logprobs_gen).sum(dim=-1).mean()
 
-        # === combine ===
-        objective = policy_obj + self.args.ent_coef * ent_gen - self.args.kl_coef * kl_gen
+        # Phase-aware entropy coef (annealed)
+        ent_coef_used = self._current_ent_coef(self.phase)
 
-        del logits_actor, logits_ref, logp_actor, p_actor, logp_ref, H_t, kl_t, logprobs_actor
-        return objective
+        # Combine
+        objective = policy_obj + ent_coef_used * ent_gen - self.args.kl_coef * kl_gen
 
-
-
-    # def rollout_once(self) -> Tuple['ReplayMemory', Dict[str, float], List[float], List[float]]:
-    #     """One rollout over the current prompt set; returns memory + metrics + raw lists for per-phase aggregation."""
-    #     # 1) sample from actor
-    #     sample_ids, samples = get_samples(
-    #         self.model,
-    #         prompts=self.actor_prompts,             # actor sees chat-formatted prompts
-    #         gen_len=self.args.gen_len,
-    #         temperature=self.args.temperature,
-    #         top_k=self.args.top_k,
-    #         prepend_bos=self.args.prepend_bos,
-    #     )
-
-    #     # 2) actor logits for logprobs
-    #     with t.inference_mode():
-    #         logits = self.model.forward_with_steering(sample_ids)
-    #     logprobs_all = get_logprobs(logits, sample_ids, prefix_len=None)   # [B, S]
-    #     logprobs_gen = logprobs_all[:, -self.args.gen_len:]                # [B, G]
-
-    #     # 3) continuations (last G tokens only, detok)
-    #     gen_only = sample_ids[:, -self.args.gen_len:]  # Int[B, G]
-    #     continuations = [self.model.to_string(row.unsqueeze(0))[0] for row in gen_only]
-
-    #     # 4) JSON judge sycophancy scores (0..1) -> reward
-    #     # Judge sees raw user prompts and the assistant continuation only
-    #     syco_scores = asyncio.run(
-    #         self.local_json_judge.score_batch_syco(
-    #             system_prompt=self.judge_scorer_system_prompt,
-    #             user_prompts=self.judge_user_prompts,
-    #             assistant_replies=continuations,
-    #         )
-    #     )
-    #     syco = t.tensor(syco_scores, dtype=t.float32, device=device)
-    #     syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-    #     rewards = syco  # sycophancy-only reward
-
-    #     if accelerator.is_main_process:
-    #         print("[rollout] sycophancy (first 5):", [round(float(s), 3) for s in syco[:5]])
-    #         print("[rollout] reward (first 5):", [round(float(r), 3) for r in rewards[:5]])
-    #         for i in range(min(2, len(continuations))):
-    #             print(f"[rollout] sample#{i} continuation: {repr(continuations[i][:160])}")
-
-    #         # Write rollout CSV once per call
-    #         with open(self.args.csv_path, "a", newline="", encoding="utf-8") as f:
-    #             w = csv.writer(f)
-    #             if f.tell() == 0:
-    #                 w.writerow(["phase", "input_prompt_raw", "actor_continuation", "sycophancy_0_1", "reward"])
-    #             for i in range(len(self.judge_user_prompts)):
-    #                 w.writerow([self.phase, self.judge_user_prompts[i], continuations[i], float(syco[i].item()), float(rewards[i].item())])
-    #         print(f"[rollout] wrote CSV -> {self.args.csv_path}")
-
-    #     # 5) RLOO baseline (leave-one-out), broadcast across generated positions
-    #     sum_r = rewards.sum()
-    #     loo_baseline = (sum_r - rewards) / max(1, (rewards.numel() - 1))
-    #     advantages_seq = rewards - loo_baseline
-    #     adv_std = advantages_seq.std().clamp_min(1e-6)
-    #     advantages_seq = advantages_seq / adv_std
-    #     advantages = einops.repeat(advantages_seq, "b -> b g", g=logprobs_gen.shape[1])
-
-    #     # dummy tensors
-    #     values = einops.repeat(advantages_seq, "b -> b s", s=sample_ids.shape[1])
-    #     ref_logits = logits.detach()
-
-    #     # Metrics for this rollout
-    #     metrics = {
-    #         "mean_syco": float(syco.mean().item()),
-    #         "std_syco": float(syco.std().item()),
-    #         "mean_reward": float(rewards.mean().item()),
-    #         "std_reward": float(rewards.std().item()),
-    #     }
-    #     syco_list = [float(x) for x in syco.detach().cpu()]
-    #     reward_list = [float(x) for x in rewards.detach().cpu()]
-
-    #     memory = ReplayMemory(
-    #         args=self.args,
-    #         sample_ids=sample_ids,
-    #         logprobs=logprobs_gen,
-    #         advantages=advantages,
-    #         values=values,
-    #         ref_logits=ref_logits,
-    #     )
-    #     return memory, metrics, syco_list, reward_list
-
-
-    def rollout_once(self) -> Tuple['ReplayMemory', Dict[str, float], List[float], List[float]]:
-        # 1) sample from actor
-        sample_ids, _samples = get_samples(
-            self.model,
-            prompts=self.actor_prompts,
-            gen_len=self.args.gen_len,
-            temperature=self.args.temperature,
-            top_k=self.args.top_k,
-            prepend_bos=self.args.prepend_bos,
-        )
-
-        # 2) continuations (last G tokens only, detok)
-        gen_only = sample_ids[:, -self.args.gen_len:].detach().clone()  # Int[B, G]
-        continuations = [self.model.to_string(row.unsqueeze(0))[0] for row in gen_only]
-
-        del _samples  # free memory
-
-        # 3) judge scores -> rewards
-        syco_scores = asyncio.run(
-            self.local_json_judge.score_batch_syco(
-                system_prompt=self.judge_scorer_system_prompt,
-                user_prompts=self.judge_user_prompts,
-                assistant_replies=continuations,
-            )
-        )
-        syco = t.tensor(syco_scores, dtype=t.float32, device=device)
-        syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        rewards = syco
-
-        if accelerator.is_main_process:
-            print("[rollout] sycophancy (first 5):", [round(float(s), 3) for s in syco[:5]])
-            print("[rollout] reward (first 5):", [round(float(r), 3) for r in rewards[:5]])
-            for i in range(min(2, len(continuations))):
-                print(f"[rollout] sample#{i} continuation: {repr(continuations[i][:160])}")
-            with open(self.args.csv_path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if f.tell() == 0:
-                    w.writerow(["phase", "input_prompt_raw", "actor_continuation", "sycophancy_0_1", "reward"])
-                for i in range(len(self.judge_user_prompts)):
-                    w.writerow([self.phase, self.judge_user_prompts[i], continuations[i],
-                                float(syco[i].item()), float(rewards[i].item())])
-            print(f"[rollout] wrote CSV -> {self.args.csv_path}")
-
-        # 4) RLOO baseline & broadcast to tokens
-        sum_r = rewards.sum()
-        loo_baseline = (sum_r - rewards) / max(1, (rewards.numel() - 1))
-        advantages_seq = rewards - loo_baseline
-        adv_std = advantages_seq.std().clamp_min(1e-6)
-        advantages_seq = advantages_seq / adv_std
-
-        advantages = einops.repeat(advantages_seq, "b -> b g", g=self.args.gen_len)
-
-        # 5) pack memory (lean)
-        memory = ReplayMemory(
-            args=self.args,
-            sample_ids=sample_ids.detach(),
-            advantages=advantages,
-        )
-
-        del gen_only,
-        t.cuda.empty_cache()  # free memory
-
-
+        # Metrics to aggregate/log this phase
         metrics = {
-            "mean_syco": float(syco.mean().item()),
-            "std_syco": float(syco.std().item()),
-            "mean_reward": float(rewards.mean().item()),
-            "std_reward": float(rewards.std().item()),
+            "kl_per_token": float(kl_gen.detach().item()),
+            "entropy_per_token": float(ent_gen.detach().item()),
+            "actor_logprob_per_token": float(logprobs_gen.mean().detach().item()),
+            "ref_logprob_per_token": float(ref_logprobs_gen.mean().detach().item()),
+            "ent_coef_used": float(ent_coef_used),
+            "kl_coef_used": float(self.args.kl_coef),
         }
-        syco_list = [float(x) for x in syco.detach().cpu()]
-        reward_list = [float(x) for x in rewards.detach().cpu()]
-        return memory, metrics, syco_list, reward_list
 
+        # Free big tensors early
+        del logits_actor, logits_ref, logp_actor, p_actor, logp_ref, H_tok, kl_tok
+        return objective, metrics
 
-    # def train(self):
-    #     self.step = 0
-
-    #     if self.args.use_wandb and accelerator.is_main_process:
-    #         wandb.init(project=self.args.wandb_project_name, entity=self.args.wandb_entity, name=self.run_name, config=self.args)
-
-    #     import numpy as np
-
-    #     for self.phase in range(self.args.total_phases):
-    #         # Collect multiple fresh rollouts if requested
-    #         roll_memories = []
-    #         all_syco_vals: List[float] = []
-    #         all_reward_vals: List[float] = []
-
-    #         num_roll = max(1, int(self.args.rollouts_per_phase))
-    #         if accelerator.is_main_process:
-    #             print(f"\n[phase {self.phase}] collecting {num_roll} rollout(s) ...")
-
-    #         for _ in range(num_roll):
-    #             mem, mtr, sy_list, rw_list = self.rollout_once()
-    #             roll_memories.append(mem)
-    #             all_syco_vals.extend(sy_list)
-    #             all_reward_vals.extend(rw_list)
-
-    #         # Concatenate memories across rollouts for a bigger update
-    #         big_memory = _cat_memories(roll_memories)
-
-    #         # Pooled metrics across rollouts for this phase
-    #         mean_syco = float(np.mean(all_syco_vals)) if all_syco_vals else float('nan')
-    #         std_syco  = float(np.std(all_syco_vals, ddof=0)) if all_syco_vals else float('nan')
-    #         mean_reward = float(np.mean(all_reward_vals)) if all_reward_vals else float('nan')
-    #         std_reward  = float(np.std(all_reward_vals, ddof=0)) if all_reward_vals else float('nan')
-
-    #         # Do the learning on the concatenated batch
-    #         loss = self.learning_phase(big_memory)
-
-    #         if accelerator.is_main_process:
-    #             print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss:.6f}")
-    #             print(f"[phase {self.phase}] pooled mean sycophancy={mean_syco:.4f} | mean reward={mean_reward:.4f}")
-
-    #             # Write per-phase training row (averaged across rollouts)
-    #             with open(self.args.train_metrics_csv, "a", newline="", encoding="utf-8") as f:
-    #                 w = csv.writer(f)
-    #                 w.writerow([
-    #                     self.phase,
-    #                     mean_syco, std_syco,
-    #                     mean_reward, std_reward,
-    #                     num_roll,
-    #                     self.args.batch_size,
-    #                 ])
-
-    #             if hasattr(self, "_log_steering_param_stats"):
-    #                 self._log_steering_param_stats(tag=f"phase{self.phase+1}")
-    #             if hasattr(self, "_steering_drift_report"):
-    #                 self._steering_drift_report()
-
-    #         if hasattr(self, "_log_steering_metrics_and_snapshot"):
-    #             self._log_steering_metrics_and_snapshot(phase_idx=self.phase)
-
-    #     if self.args.use_wandb and accelerator.is_main_process:
-    #         wandb.finish()
 
     def train(self):
+        """
+        [FIXED (Comment 0)] This is the new, correct training loop.
+        It calls the correct `rollout_phase` and logs metrics.
+        """
         self.step = 0
 
         if self.args.use_wandb and accelerator.is_main_process:
@@ -1313,150 +1160,56 @@ class RLOOTrainer(RLHFTrainer):
         import numpy as np
 
         for self.phase in range(self.args.total_phases):
-            num_roll = max(1, int(self.args.rollouts_per_phase))
             
-            if accelerator.is_main_process:
-                print(f"\n[phase {self.phase}] generating {num_roll} rollout(s) ...")
+            # 1. Call the CORRECT rollout function. 
+            # This one function handles all K rollouts AND computes the correct advantages.
+            big_memory = self.rollout_phase() 
+            
+            # 2. Get pooled metrics from this phase (stashed by rollout_phase)
+            mean_syco = getattr(self, "_last_mean_syco", float('nan'))
+            std_syco = getattr(self, "_last_std_syco", float('nan'))
+            mean_reward = getattr(self, "_last_mean_reward", float('nan'))
+            std_reward = getattr(self, "_last_std_reward", float('nan'))
+            num_roll = self.args.rollouts_per_phase
 
-            # ========== Step 1: Generate all samples across rollouts ==========
-            all_sample_ids = []
-            all_continuations = []
-            
-            for rollout_idx in range(num_roll):
-                sample_ids, _ = get_samples(
-                    self.model,
-                    prompts=self.actor_prompts,
-                    gen_len=self.args.gen_len,
-                    temperature=self.args.temperature,
-                    top_k=self.args.top_k,
-                    prepend_bos=self.args.prepend_bos,
-                )
-                
-                # Extract continuations (last G tokens only)
-                gen_only = sample_ids[:, -self.args.gen_len:]
-                continuations = [self.model.to_string(row.unsqueeze(0))[0] for row in gen_only]
-                
-                all_sample_ids.append(sample_ids.detach())
-                all_continuations.extend(continuations)
-                
-                if accelerator.is_main_process and rollout_idx == 0:
-                    print(f"[rollout {rollout_idx}] sample continuation: {repr(continuations[0][:160])}")
-            
-            # ========== Step 2: Batch judge all continuations at once ==========
-            if accelerator.is_main_process:
-                print(f"[phase {self.phase}] calling judge for {len(all_continuations)} samples ...")
-            
-            # Repeat user prompts for each rollout
-            all_user_prompts = self.judge_user_prompts * num_roll
-            
-            syco_scores = asyncio.run(
-                self.local_json_judge.score_batch_syco(
-                    system_prompt=self.judge_scorer_system_prompt,
-                    user_prompts=all_user_prompts,
-                    assistant_replies=all_continuations,
-                )
-            )
-            
-            # Convert to tensor and sanitize
-            syco = t.tensor(syco_scores, dtype=t.float32, device=device)
-            syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-            rewards = syco
-            
-            if accelerator.is_main_process:
-                print("[judge] sycophancy scores (first 5):", [round(float(s), 3) for s in syco[:5]])
-                print("[judge] rewards (first 5):", [round(float(r), 3) for r in rewards[:5]])
-            
-            # ========== Step 3: Split scores back into rollouts and create memories ==========
-            roll_memories = []
-            all_syco_vals = []
-            all_reward_vals = []
-            
-            for rollout_idx in range(num_roll):
-                # Slice out this rollout's scores
-                start_idx = rollout_idx * self.args.batch_size
-                end_idx = start_idx + self.args.batch_size
-                
-                rollout_syco = syco[start_idx:end_idx]
-                rollout_rewards = rewards[start_idx:end_idx]
-                rollout_sample_ids = all_sample_ids[rollout_idx]
-                
-                # RLOO baseline (leave-one-out)
-                sum_r = rollout_rewards.sum()
-                loo_baseline = (sum_r - rollout_rewards) / max(1, (rollout_rewards.numel() - 1))
-                advantages_seq = rollout_rewards - loo_baseline
-                adv_std = advantages_seq.std().clamp_min(1e-6)
-                advantages_seq = advantages_seq / adv_std
-                
-                # Broadcast advantages across generated tokens
-                advantages = einops.repeat(advantages_seq, "b -> b g", g=self.args.gen_len)
-                
-                # Create memory for this rollout
-                memory = ReplayMemory(
-                    args=self.args,
-                    sample_ids=rollout_sample_ids,
-                    advantages=advantages,
-                )
-                roll_memories.append(memory)
-                
-                # Collect metrics
-                all_syco_vals.extend([float(x) for x in rollout_syco.detach().cpu()])
-                all_reward_vals.extend([float(x) for x in rollout_rewards.detach().cpu()])
-                
-                # Write to CSV
-                if accelerator.is_main_process:
-                    continuations_slice = all_continuations[start_idx:end_idx]
-                    with open(self.args.csv_path, "a", newline="", encoding="utf-8") as f:
-                        w = csv.writer(f)
-                        if f.tell() == 0:
-                            w.writerow(["phase", "rollout", "input_prompt_raw", "actor_continuation", "sycophancy_0_1", "reward"])
-                        for i in range(len(self.judge_user_prompts)):
-                            w.writerow([
-                                self.phase,
-                                rollout_idx,
-                                self.judge_user_prompts[i],
-                                continuations_slice[i],
-                                float(rollout_syco[i].item()),
-                                float(rollout_rewards[i].item())
-                            ])
-            
-            if accelerator.is_main_process:
-                print(f"[phase {self.phase}] wrote rollout data -> {self.args.csv_path}")
-            
-            # ========== Step 4: Concatenate memories and do learning ==========
-            big_memory = _cat_memories(roll_memories)
+            # 3. Do the learning on the concatenated batch
             loss = self.learning_phase(big_memory)
-            
-            # ========== Step 5: Compute and log metrics ==========
-            mean_syco = float(np.mean(all_syco_vals)) if all_syco_vals else float('nan')
-            std_syco = float(np.std(all_syco_vals, ddof=0)) if all_syco_vals else float('nan')
-            mean_reward = float(np.mean(all_reward_vals)) if all_reward_vals else float('nan')
-            std_reward = float(np.std(all_reward_vals, ddof=0)) if all_reward_vals else float('nan')
-            
+
+            # 4. Pull per-phase training metrics (KL, entropy, etc.)
+            tm = getattr(self, "_last_train_metrics", {})
+            mean_kl = tm.get("mean_kl_per_token", float('nan'))
+            mean_ent = tm.get("mean_entropy_per_token", float('nan'))
+            used_kl_coef = tm.get("kl_coef_used", self.args.kl_coef)
+            used_ent_coef = tm.get("ent_coef_used", self._current_ent_coef(self.phase))
+
+            # 5. Log everything
             if accelerator.is_main_process:
                 print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss:.6f}")
-                print(f"[phase {self.phase}] pooled mean sycophancy={mean_syco:.4f} | mean reward={mean_reward:.4f}")
-                
-                # Write training metrics
+                print(f"[phase {self.phase}] pooled mean sycophancy={mean_syco:.4f} | mean reward={mean_reward:.4f} "
+                      f"| KL/token={mean_kl:.4f} | H/token={mean_ent:.4f} | kl_coef={used_kl_coef:.3f} | ent_coef={used_ent_coef:.5f}")
+
                 with open(self.args.train_metrics_csv, "a", newline="", encoding="utf-8") as f:
                     w = csv.writer(f)
                     w.writerow([
                         self.phase,
                         mean_syco, std_syco,
                         mean_reward, std_reward,
+                        mean_kl, mean_ent,
+                        used_kl_coef, used_ent_coef,
                         num_roll,
                         self.args.batch_size,
                     ])
-                
+
                 if hasattr(self, "_log_steering_param_stats"):
                     self._log_steering_param_stats(tag=f"phase{self.phase+1}")
                 if hasattr(self, "_steering_drift_report"):
                     self._steering_drift_report()
-            
+
             if hasattr(self, "_log_steering_metrics_and_snapshot"):
                 self._log_steering_metrics_and_snapshot(phase_idx=self.phase)
-            
-            # Cleanup
-            del all_sample_ids, all_continuations, syco, rewards, roll_memories, big_memory
+
+            # 6. Cleanup
+            del big_memory
             t.cuda.empty_cache()
 
         if self.args.use_wandb and accelerator.is_main_process:
@@ -1550,7 +1303,7 @@ if __name__ == "__main__":
 
         # batch = number of prompts
         batch_size=len(formatted_prompts),  # must equal number of prompts
-        num_minibatches=3,                  # keep as-is; you asked not to use this as a knob
+        num_minibatches=3,               # keep as-is; you asked not to use this as a knob
         batches_per_learning_phase=8,       # <-- your chosen OOM/stability knob
 
         gen_len=120,
@@ -1558,7 +1311,7 @@ if __name__ == "__main__":
         top_k=None,
         prepend_bos=False,
 
-        steering_layer_indices=None,        # all layers
+        steering_layer_indices=None,       # all layers
         steering_init_scale=0.2,
 
         # Actor vs judge prompts
@@ -1566,17 +1319,41 @@ if __name__ == "__main__":
         judge_user_prompts_inline=raw_prompts,
 
         # Multi-rollout
-        rollouts_per_phase=8,              # <-- 16 rollouts each phase (as requested)
+        rollouts_per_phase=8,               # <-- 8 rollouts each phase
 
         # Opt (stabilized)
         base_lr=5e-4,
         max_grad_norm=2.0,
-        ent_coef=0.001,
-        kl_coef=0.6,
-    )   
+        # ent_coef=0.001,
+        # kl_coef=0.6,
+
+
+        use_adaptive_kl=True,       # or False
+        kl_target_nats=0.05,
+        kl_coef=0.6,                # initial
+        kl_coef_min=0.05,
+        kl_coef_max=3.0,
+        kl_up=1.05,
+        kl_down=0.97,
+
+        use_entropy_anneal=True,     # or False
+        ent_coef_start=0.005,
+        ent_coef_end=0.0,
+        ent_warmup_phases=2,
+    )    
 
     trainer = RLOOTrainer(rloo_args)
-    trainer.train()
+    
+    try:
+        trainer.train()
+    except (KeyboardInterrupt, Exception) as e:
+        print(f"Training interrupted or failed: {e}")
+    finally:
+        # [FIX (Comment 2)] Ensure client is closed
+        if accelerator.is_main_process:
+            print("Cleaning up judge client...")
+            asyncio.run(trainer.local_json_judge.aclose())
+            print("Cleanup complete.")
 
     if accelerator.is_main_process and rloo_args.plot_steering_after_training:
         _maybe_plot_steering_csv(rloo_args.steering_log_csv, out_png=rloo_args.steering_plot_png)
