@@ -12,35 +12,35 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 TOP_K = 100
 LAYER_INDICES = [3, 15, 27]
 SAE_PATH = "/disk/u/troitskiid/projects/arena_rl_steering/saes-llama-3.1-8b-instruct"
-STEERING_SNAPSHOT_PATH = "/disk/u/troitskiid/projects/arena_rl_steering/llm_judge_KL/steering_phase_014.pt"
+STEERING_SNAPSHOT_PATH = "/disk/u/troitskiid/projects/arena_rl_steering/steering_snapshots/steering_phase_000.pt"
 
 # %%
 # as an experiment, generate 3 random vectors to test
-import torch.nn as nn
+# import torch.nn as nn
 
-random_vectors = {}
-for layer in LAYER_INDICES:
-    # Generate random vector with same dimension as model (4096 for Llama 3.1 8B)
-    random_vec = torch.randn(4096, device=device)
-    # Normalize to unit length
-    random_vec = random_vec / random_vec.norm()
-    random_vectors[layer] = random_vec
+# random_vectors = {}
+# for layer in LAYER_INDICES:
+#     # Generate random vector with same dimension as model (4096 for Llama 3.1 8B)
+#     random_vec = torch.randn(4096, device=device)
+#     # Normalize to unit length
+#     random_vec = random_vec / random_vec.norm()
+#     random_vectors[layer] = random_vec
 
-# Use random vectors instead of steering snapshot
-steering_vectors = random_vectors
+# # Use random vectors instead of steering snapshot
+# steering_vectors = random_vectors
 
 # #%% Load steering vectors
 
-# steering_snapshot = torch.load(STEERING_SNAPSHOT_PATH, map_location=device)
+steering_snapshot = torch.load(STEERING_SNAPSHOT_PATH, map_location=device)
 
-# steering_vectors = {}
+steering_vectors = {}
 
-# for layer in LAYER_INDICES:
-#     key = f"steering_hooks.{layer}.vec_ln1.vector"
-#     steering_vectors[layer] = steering_snapshot[key]
+for layer in LAYER_INDICES:
+    key = f"steering_hooks.{layer}.vec_ln1.vector"
+    steering_vectors[layer] = steering_snapshot[key]
 
-# # %%
-# steering_snapshot
+# %%
+steering_snapshot
 
 #%% Load SAEs
 
