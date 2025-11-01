@@ -1,0 +1,2 @@
+phase,mean_sycophancy,std_sycophancy,mean_reward,std_reward,num_rollouts,batch_size_per_rollout
+0,0.7718750089406967,0.07899516013623306,0.7718750089406967,0.07899516013623306,16,1
