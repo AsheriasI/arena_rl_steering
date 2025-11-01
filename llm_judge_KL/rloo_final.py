@@ -51,7 +51,7 @@ BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # actor (TransformerLens)
 
 # Use OpenRouter instead of your local vLLM
 JUDGE_BASE_URL = "https://openrouter.ai/api/v1"
-JUDGE_MODEL = "openai/gpt-5-mini"  # or whatever exact ID your account has access to
+JUDGE_MODEL = "openai/gpt-5"  # or whatever exact ID your account has access to
 
 
 # ============== JSON Judge Prompt (rate sycophancy) ==============
@@ -492,11 +492,14 @@ class RLHFTrainer:
 
     def learning_phase(self, memory):
         loss_val = 0.0
+        entropy_val = 0.0
+        kl_penalty_val = 0.0
         minibatches = memory.get_minibatches()
 
         for minibatch in minibatches:
             self.optimizer.zero_grad()
-            total_objective = self.compute_rlhf_objective(minibatch)
+            objective_components = self.compute_rlhf_objective(minibatch)
+            total_objective = objective_components['total']
 
             # --- Non-finite guard ---
             if not t.isfinite(total_objective):
@@ -530,10 +533,14 @@ class RLHFTrainer:
 
             self.step += 1
             loss_val += float(total_objective.item())
+            entropy_val += float(objective_components['entropy'].item())
+            kl_penalty_val += float(objective_components['kl_penalty'].item())
 
         loss_val /= max(1, len(minibatches))
+        entropy_val /= max(1, len(minibatches))
+        kl_penalty_val /= max(1, len(minibatches))
         self.scheduler.step()
-        return loss_val
+        return loss_val, entropy_val, kl_penalty_val
 
     def train(self):
         self.step = 0
@@ -544,9 +551,9 @@ class RLHFTrainer:
         for self.phase in range(self.args.total_phases):
             # By default subclasses will implement rollout + learning.
             memory = self.rollout_phase()
-            loss = self.learning_phase(memory)
+            loss, entropy, kl_penalty = self.learning_phase(memory)
             if accelerator.is_main_process:
-                print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss:.6f}")
+                print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss:.6f}, entropy={entropy:.6f}, kl_penalty={kl_penalty:.6f}")
                 if hasattr(self, "_log_steering_param_stats"):
                     self._log_steering_param_stats(tag=f"phase{self.phase+1}")
                 if hasattr(self, "_steering_drift_report"):
@@ -685,7 +692,7 @@ def load_prompts(prompts_path: Optional[str], prompts_inline: Optional[list[str]
 @dataclass
 class RLOOArgs(RLHFArgs):
     steering_layer_indices: list[int] = None
-    steering_init_scale: float = 1
+    steering_init_scale: float = 0.2
 
     judge_system_prompt_path: str = "judge_prompt.txt"  # legacy; not used
     judge_concurrency: int = 32
@@ -1091,7 +1098,12 @@ class RLOOTrainer(RLHFTrainer):
         objective = policy_obj + self.args.ent_coef * ent_gen - self.args.kl_coef * kl_gen
 
         del logits_actor, logits_ref, logp_actor, p_actor, logp_ref, H_t, kl_t, logprobs_actor
-        return objective
+        return {
+            'total': objective,
+            'policy': policy_obj,
+            'entropy': self.args.ent_coef * ent_gen,
+            'kl_penalty': -self.args.kl_coef * kl_gen
+        }
 
 
 
@@ -1431,10 +1443,9 @@ class RLOOTrainer(RLHFTrainer):
             
             if accelerator.is_main_process:
                 print(f"[phase {self.phase}] wrote rollout data -> {self.args.csv_path}")
-            
             # ========== Step 4: Concatenate memories and do learning ==========
             big_memory = _cat_memories(roll_memories)
-            loss = self.learning_phase(big_memory)
+            loss_val, entropy_val, kl_penalty_val = self.learning_phase(big_memory)
             
             # ========== Step 5: Compute and log metrics ==========
             mean_syco = float(np.mean(all_syco_vals)) if all_syco_vals else float('nan')
@@ -1443,7 +1454,7 @@ class RLOOTrainer(RLHFTrainer):
             std_reward = float(np.std(all_reward_vals, ddof=0)) if all_reward_vals else float('nan')
             
             if accelerator.is_main_process:
-                print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss:.6f}")
+                print(f"[phase {self.phase+1}/{self.args.total_phases}] objective={loss_val:.6f}, entropy={entropy_val:.6f}, kl_penalty={kl_penalty_val:.6f}")
                 print(f"[phase {self.phase}] pooled mean sycophancy={mean_syco:.4f} | mean reward={mean_reward:.4f}")
                 
                 # Write training metrics
@@ -1569,7 +1580,7 @@ if __name__ == "__main__":
         prepend_bos=False,
 
         steering_layer_indices=None,        # all layers
-        steering_init_scale=1,
+        steering_init_scale=0.2,
 
         # Actor vs judge prompts
         actor_prompts_inline=formatted_prompts,
@@ -1582,7 +1593,7 @@ if __name__ == "__main__":
         base_lr=5e-4,
         max_grad_norm=2.0,
         ent_coef=0.001,
-        kl_coef=0.6,
+        kl_coef=2.0,
     )   
 
     trainer = RLOOTrainer(rloo_args)
