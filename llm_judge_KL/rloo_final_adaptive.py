@@ -26,7 +26,7 @@ from transformer_lens.hook_points import HookPoint
 from transformers import AutoTokenizer
 
 # ============== GPU / Accelerate ==============
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "7")
 
 from accelerate import Accelerator
 
@@ -724,7 +724,7 @@ def load_prompts(prompts_path: Optional[str], prompts_inline: Optional[list[str]
 @dataclass
 class RLOOArgs(RLHFArgs):
     steering_layer_indices: list[int] = None
-    steering_init_scale: float = 1
+    steering_init_scale: float = 0.1
 
     judge_system_prompt_path: str = "judge_prompt.txt"  # legacy; not used
     judge_concurrency: int = 32
@@ -748,19 +748,18 @@ class RLOOArgs(RLHFArgs):
     plot_train_png: Optional[str] = None
     rollouts_per_phase: int = 1  # <-- collect this many fresh rollouts each phase
 
-    # ===== New: Adaptive KL controls =====
-    use_adaptive_kl: bool = True
-    kl_target_nats: float = 0.05         # target KL/token
-    kl_coef_min: float = 0.05
-    kl_coef_max: float = 3.0
-    kl_up: float = 1.05                  # multiplicative up/down
-    kl_down: float = 0.97
+    use_adaptive_kl=True,         # or False
+    kl_target_nats=0.05,
+    kl_coef=0.3,                  # initial
+    kl_coef_min=0.05,
+    kl_coef_max=3.0,
+    kl_up=1.05,
+    kl_down=0.97,
 
-    # ===== New: Entropy anneal controls =====
-    use_entropy_anneal: bool = True
-    ent_coef_start: float = 0.005        # overrides RLHFArgs.ent_coef if anneal is on
-    ent_coef_end: float = 0.0
-    ent_warmup_phases: int = 2
+    use_entropy_anneal=True,      # or False
+    ent_coef_start=0.01,
+    ent_coef_end=0.0,
+    ent_warmup_phases=2,
 
 class RLOOTrainer(RLHFTrainer):
     @staticmethod
@@ -1661,7 +1660,7 @@ if __name__ == "__main__":
         prepend_bos=False,
 
         steering_layer_indices=None,        # all layers
-        steering_init_scale=1,
+        steering_init_scale=0.1,
 
         # Actor vs judge prompts
         actor_prompts_inline=formatted_prompts,
@@ -1679,14 +1678,14 @@ if __name__ == "__main__":
 
         use_adaptive_kl=True,         # or False
         kl_target_nats=0.05,
-        kl_coef=0.6,                  # initial
+        kl_coef=0.3,                  # initial
         kl_coef_min=0.05,
         kl_coef_max=3.0,
         kl_up=1.05,
         kl_down=0.97,
 
         use_entropy_anneal=True,      # or False
-        ent_coef_start=0.005,
+        ent_coef_start=0.01,
         ent_coef_end=0.0,
         ent_warmup_phases=2,
     )   
