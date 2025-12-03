@@ -25,7 +25,7 @@ from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
 # ============== GPU / Accelerate ==============
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from accelerate import Accelerator
 
@@ -490,10 +490,14 @@ class RLHFTrainer:
 
         self.model = HookedTransformerWithSteering.from_pretrained(
             args.base_model,
+            device_map="auto",
+            dtype=t.bfloat16,
         ).to(device).train()
 
         self.ref_model = HookedTransformer.from_pretrained(
             args.base_model,
+            device_map="auto",
+            dtype=t.bfloat16,
         ).to(device).eval()
 
         self.optimizer, self.scheduler = get_optimizer_and_scheduler(self.args, self.model)
@@ -758,6 +762,8 @@ class RLOOTrainer(RLHFTrainer):
         # actor with steering
         self.model = HookedTransformerWithSteering.from_pretrained(
             args.base_model,
+            device_map="auto",
+            dtype=t.bfloat16,
             layer_indices=args.steering_layer_indices,
             init_scale=args.steering_init_scale,
         ).to(device).train()
@@ -765,6 +771,8 @@ class RLOOTrainer(RLHFTrainer):
         # Frozen reference model (no steering, no grads)
         self.ref_model = HookedTransformer.from_pretrained(
             args.base_model,
+            device_map="auto",
+            dtype=t.bfloat16,
         ).to(device).eval()
         for p in self.ref_model.parameters():
             p.requires_grad_(False)
@@ -1019,7 +1027,7 @@ class RLOOTrainer(RLHFTrainer):
                 assistant_replies=all_continuations,
             )
         )
-        syco = t.tensor(syco_scores, dtype=t.float32, device=device)
+        syco = t.tensor(syco_scores, dtype=t.bfloat16, device=device)
         syco = t.nan_to_num(syco, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         rewards = syco  # [B*K]
 
@@ -1304,7 +1312,7 @@ if __name__ == "__main__":
         # batch = number of prompts
         batch_size=len(formatted_prompts),  # must equal number of prompts
         num_minibatches=3,               # keep as-is; you asked not to use this as a knob
-        batches_per_learning_phase=8,       # <-- your chosen OOM/stability knob
+        batches_per_learning_phase=12,       # <-- your chosen OOM/stability knob
 
         gen_len=120,
         temperature=0.7,
@@ -1319,7 +1327,7 @@ if __name__ == "__main__":
         judge_user_prompts_inline=raw_prompts,
 
         # Multi-rollout
-        rollouts_per_phase=8,               # <-- 8 rollouts each phase
+        rollouts_per_phase=12,               # <-- 8 rollouts each phase
 
         # Opt (stabilized)
         base_lr=5e-4,
@@ -1352,8 +1360,14 @@ if __name__ == "__main__":
         # [FIX (Comment 2)] Ensure client is closed
         if accelerator.is_main_process:
             print("Cleaning up judge client...")
-            asyncio.run(trainer.local_json_judge.aclose())
-            print("Cleanup complete.")
+            try:
+                asyncio.run(trainer.local_json_judge.aclose())
+                print("Cleanup complete.")
+            except RuntimeError as e:
+                if "Event loop is closed" in str(e):
+                    print("Event loop already closed, skipping client cleanup.")
+                else:
+                    print(f"Error during cleanup: {e}")
 
     if accelerator.is_main_process and rloo_args.plot_steering_after_training:
         _maybe_plot_steering_csv(rloo_args.steering_log_csv, out_png=rloo_args.steering_plot_png)
