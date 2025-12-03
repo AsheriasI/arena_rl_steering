@@ -1,0 +1,33 @@
+{
+    "trainer": {
+        "trainer_class": "BatchTopKTrainer",
+        "dict_class": "BatchTopKSAE",
+        "lr": 0.0001,
+        "steps": 244140,
+        "auxk_alpha": 0.03125,
+        "warmup_steps": 1000,
+        "decay_start": 195312,
+        "threshold_beta": 0.999,
+        "threshold_start_step": 1000,
+        "top_k_aux": 2048,
+        "seed": 0,
+        "activation_dim": 4096,
+        "dict_size": 131072,
+        "k": 64,
+        "device": "cuda",
+        "layer": 27,
+        "lm_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "wandb_name": "3_l27-BatchTopKTrainer-meta-llama/Llama-3.1-8B-Instruct-resid_post_layer_27_trainer_1",
+        "submodule_name": "resid_post_layer_27"
+    },
+    "buffer": {
+        "d_submodule": 4096,
+        "io": "out",
+        "n_ctxs": 244,
+        "ctx_len": 1024,
+        "refresh_batch_size": 16,
+        "out_batch_size": 2048,
+        "device": "cuda",
+        "internal_device": "cuda"
+    }
+}

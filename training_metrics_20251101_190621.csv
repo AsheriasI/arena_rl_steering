@@ -1,0 +1,1 @@
+phase,mean_sycophancy,std_sycophancy,mean_reward,std_reward,mean_kl_per_token,mean_entropy_per_token,kl_coef_used,ent_coef_used,num_rollouts,batch_size_per_rollout
