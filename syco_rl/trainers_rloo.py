@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import einops
 import torch as t
+import wandb
 from jaxtyping import Float, Int
 from transformer_lens import HookedTransformer
 
@@ -251,7 +252,6 @@ class RLOOTrainer(RLHFTrainer):
             if self.args.use_wandb:
                 wb = {f"steering/{k}": v for k, v in metrics.items()}
                 wb["phase"] = phase_idx
-                import wandb
                 wandb.log(wb)
             if save_snapshot and self.phase % 10 == 0:
                 self._save_steering_snapshot(phase_idx)
@@ -465,7 +465,6 @@ class RLOOTrainer(RLHFTrainer):
         self.step = 0
 
         if self.args.use_wandb and accelerator.is_main_process:
-            import wandb
             wandb.init(project=self.args.wandb_project_name, entity=self.args.wandb_entity, name=self.run_name, config=self.args)
 
         import numpy as np
@@ -524,6 +523,5 @@ class RLOOTrainer(RLHFTrainer):
             t.cuda.empty_cache()
 
         if self.args.use_wandb and accelerator.is_main_process:
-            import wandb
             wandb.finish()
 

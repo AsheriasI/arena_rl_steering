@@ -43,7 +43,7 @@ class ReplayMemory:
 
 
 # Helper: concatenate memories (for multiple rollouts per phase)
-def _cat_memories(memories: list["ReplayMemory"]) -> "ReplayMemory":
+def _cat_memories(memories: list['ReplayMemory']) -> 'ReplayMemory':
     assert len(memories) > 0
     args0 = memories[0].args
     sample_ids = t.cat([m.sample_ids for m in memories], dim=0)

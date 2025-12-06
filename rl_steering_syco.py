@@ -45,7 +45,7 @@ BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"    # actor (TransformerLens)
 
 # Use OpenRouter instead of your local vLLM
 JUDGE_BASE_URL = "https://openrouter.ai/api/v1"
-JUDGE_MODEL = "openai/gpt-5"  # or whatever exact ID your account has access to
+JUDGE_MODEL = "openai/gpt-5-mini"  # or whatever exact ID your account has access to
 
 
 # ============== JSON Judge Prompt (rate sycophancy) ==============
