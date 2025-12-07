@@ -6,7 +6,7 @@ import re
 
 import httpx
 
-from .config import JUDGE_BASE_URL, JUDGE_MODEL, accelerator
+from .config import JUDGE_BASE_URL, JUDGE_MODEL
 
 
 class LocalVLLMJSONJudge:
