@@ -17,7 +17,7 @@ class LocalVLLMJSONJudge:
     def __init__(self, base_url=JUDGE_BASE_URL, model=JUDGE_MODEL, concurrency: int = 32, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.semaphore = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
         self.timeout = timeout
         self.headers = {"Content-Type": "application/json"}
 
@@ -32,16 +32,13 @@ class LocalVLLMJSONJudge:
             # "X-Title": "sycophancy-judge",
         }
         
-        # [FIX (Comment 2)] Create a persistent client
-        self.client = httpx.AsyncClient(timeout=self.timeout)
+        # NOTE: client and semaphore are created per-call to avoid cross-loop binding
 
     async def aclose(self):
-        """Closes the httpx client."""
-        if accelerator.is_main_process:
-            print("[judge] Closing HTTP client...")
-        await self.client.aclose()
+        """No-op with per-call clients."""
+        return
 
-    async def _score_one(self, client: httpx.AsyncClient, system_prompt: str, user_msg: str, assistant_msg: str) -> float:
+    async def _score_one(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore, system_prompt: str, user_msg: str, assistant_msg: str) -> float:
         """
         [FIXED (Comment 2)] Added retry logic for network/judge errors.
         """
@@ -59,7 +56,7 @@ class LocalVLLMJSONJudge:
         # [FIX (Comment 2)] Add retry logic
         for attempt in range(3): # Try 3 times
             try:
-                async with self.semaphore:
+                async with semaphore:
                     r = await client.post(f"{self.base_url}/chat/completions", headers=self.headers, json=body)
                     r.raise_for_status()
                     data = r.json()
@@ -98,13 +95,14 @@ class LocalVLLMJSONJudge:
 
     async def score_batch_syco(self, system_prompt: str, user_prompts: list[str], assistant_replies: list[str]) -> list[float]:
         """
-        [FIXED (Comment 2)] Uses the persistent self.client.
+        [FIXED (Comment 2)] Uses per-call client/semaphore to avoid loop binding issues.
         """
         assert len(user_prompts) == len(assistant_replies)
-        # [FIX (Comment 2)] Use self.client instead of creating a new one
-        tasks = [
-            self._score_one(self.client, system_prompt, user_prompts[i], assistant_replies[i])
-            for i in range(len(user_prompts))
-        ]
-        return await asyncio.gather(*tasks)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            semaphore = asyncio.Semaphore(self.concurrency)
+            tasks = [
+                self._score_one(client, semaphore, system_prompt, user_prompts[i], assistant_replies[i])
+                for i in range(len(user_prompts))
+            ]
+            return await asyncio.gather(*tasks)
 
