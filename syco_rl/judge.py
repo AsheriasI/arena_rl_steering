@@ -2,100 +2,111 @@ import asyncio
 import json
 import math
 import os
+import random
 import re
+import time
 
 import httpx
 
 from .config import JUDGE_BASE_URL, JUDGE_MODEL
 
 
-class LocalVLLMJSONJudge:
+class Judge:
     """
-    Calls /v1/chat/completions to get {"sycophancy": float, "explanation": "..."}.
-    [FIXED (Comment 2)] Now uses a persistent client and includes retries.
+    Calls OpenRouter /chat/completions to get {\"sycophancy\": float, \"explanation\": \"...\"}.
+    Per-call client/semaphore to avoid cross-loop binding.
     """
-    def __init__(self, base_url=JUDGE_BASE_URL, model=JUDGE_MODEL, concurrency: int = 32, timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = JUDGE_BASE_URL,
+        model: str = JUDGE_MODEL,
+        concurrency: int = 32,
+        timeout: float = 30.0,
+        api_key: str | None = None,
+        referer: str | None = None,
+        title: str | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.concurrency = concurrency
         self.timeout = timeout
-        self.headers = {"Content-Type": "application/json"}
 
-        # OpenRouter requires the bearer token; referer/title are recommended but optional
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        assert api_key, "Set OPENROUTER_API_KEY in your environment."
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
+        key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        assert key, "Set OPENROUTER_API_KEY in your environment or pass api_key."
+        headers = {
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            # Optional (helps with routing/usage analytics):
-            # "HTTP-Referer": "http://localhost",    # or your site/app URL
-            # "X-Title": "sycophancy-judge",
         }
-        
-        # NOTE: client and semaphore are created per-call to avoid cross-loop binding
+        if referer:
+            headers["HTTP-Referer"] = referer
+        if title:
+            headers["X-Title"] = title
+        self.headers = headers
 
     async def aclose(self):
         """No-op with per-call clients."""
         return
 
-    async def _score_one(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore, system_prompt: str, user_msg: str, assistant_msg: str) -> float:
-        """
-        [FIXED (Comment 2)] Added retry logic for network/judge errors.
-        """
-        body = {
+    def _build_body(self, system_prompt: str, user_msg: str, assistant_msg: str) -> dict:
+        return {
             "model": self.model,
             "temperature": 0.0,
-            # "max_tokens": None,
-            "response_format": {"type": "json_object"},  # ensure we get text back
+            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"User:\n{user_msg}\n\nAssistant:\n{assistant_msg}"},
-            ]
+            ],
         }
-        
-        # [FIX (Comment 2)] Add retry logic
-        for attempt in range(3): # Try 3 times
+
+    def _backoff(self, attempt: int) -> float:
+        # simple decorrelated jitter backoff: base 1s
+        return (1.0 * (attempt + 1)) * (0.5 + random.random())
+
+    async def _score_one(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore, system_prompt: str, user_msg: str, assistant_msg: str) -> float:
+        body = self._build_body(system_prompt, user_msg, assistant_msg)
+        url = f"{self.base_url}/chat/completions"
+
+        for attempt in range(3):
             try:
                 async with semaphore:
-                    r = await client.post(f"{self.base_url}/chat/completions", headers=self.headers, json=body)
-                    r.raise_for_status()
-                    data = r.json()
+                    r = await client.post(url, headers=self.headers, json=body)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    raise httpx.HTTPStatusError(f"{r.status_code} {r.reason_phrase}", request=r.request, response=r)
+                r.raise_for_status()
+                data = r.json()
 
-                # --- DEBUG: show raw completion text ---
                 txt = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
                 raw = txt.strip()
-                
-                # Try to extract JSON
+
                 m = re.search(r"\{.*\}", raw, re.DOTALL)
                 if not m:
-                    print(f"[json-judge][warn] No JSON found, attempt {attempt+1}/3. Retrying... Raw: {raw[:100]}")
-                    await asyncio.sleep(1.0 * (attempt + 1)) # Exponential backoff
-                    continue # Go to next attempt
+                    print(f"[json-judge][warn] No JSON found, attempt {attempt+1}/3. Raw: {raw[:120]}")
+                    await asyncio.sleep(self._backoff(attempt))
+                    continue
 
                 obj = json.loads(m.group(0))
                 s = float(obj.get("sycophancy", 0.0))
-                
                 if not math.isfinite(s):
-                    print(f"[json-judge][warn] Non-finite score {s}, attempt {attempt+1}/3. Retrying...")
-                    await asyncio.sleep(1.0 * (attempt + 1))
-                    continue # Go to next attempt
+                    print(f"[json-judge][warn] Non-finite score {s}, attempt {attempt+1}/3.")
+                    await asyncio.sleep(self._backoff(attempt))
+                    continue
 
-                return max(0.0, min(1.0, s)) # Success!
+                return max(0.0, min(1.0, s))
 
             except httpx.HTTPStatusError as e:
-                print(f"[json-judge][http-error] {e} (attempt {attempt+1}/3). Retrying...")
-                await asyncio.sleep(1.0 * (attempt + 1))
+                print(f"[json-judge][http-error] {e} (attempt {attempt+1}/3).")
+                await asyncio.sleep(self._backoff(attempt))
             except Exception as e:
-                print(f"[json-judge][error] {e} (attempt {attempt+1}/3). Retrying...")
-                await asyncio.sleep(1.0 * (attempt + 1))
+                print(f"[json-judge][error] {e} (attempt {attempt+1}/3).")
+                await asyncio.sleep(self._backoff(attempt))
 
-        print(f"[json-judge][error] All retries failed for prompt: {user_msg[:50]}... Returning 0.0 as fallback.")
-        return 0.0 # Fallback after all retries fail
+        print(f"[json-judge][error] All retries failed for prompt: {user_msg[:80]}... Returning 0.0 as fallback.")
+        return 0.0
 
 
     async def score_batch_syco(self, system_prompt: str, user_prompts: list[str], assistant_replies: list[str]) -> list[float]:
         """
-        [FIXED (Comment 2)] Uses per-call client/semaphore to avoid loop binding issues.
+        Uses per-call client/semaphore to avoid loop binding issues.
         """
         assert len(user_prompts) == len(assistant_replies)
         async with httpx.AsyncClient(timeout=self.timeout) as client:

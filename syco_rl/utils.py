@@ -13,7 +13,7 @@ def _resolve_path(path_str: str) -> Path:
 def load_judge_prompt(path: str = "prompts/judge_prompt.txt") -> str:
     return _resolve_path(path).read_text(encoding="utf-8").strip()
 
-# syco_rl/utils.py
+
 def _strip_jsonc(text: str) -> str:
     # Remove // line comments
     text = re.sub(r"(?m)^\s*//.*$", "", text)

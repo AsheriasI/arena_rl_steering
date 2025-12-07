@@ -73,7 +73,7 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             print("Cleaning up judge client...")
             try:
-                asyncio.run(trainer.local_json_judge.aclose())
+                asyncio.run(trainer.judge.aclose())
                 print("Cleanup complete.")
             except RuntimeError as e:
                 if "Event loop is closed" in str(e):

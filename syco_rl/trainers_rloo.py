@@ -20,7 +20,7 @@ from .config import (
     accelerator,
     device,
 )
-from .judge import LocalVLLMJSONJudge
+from .judge import Judge
 from .replay import ReplayMemory, ReplayMinibatch, load_prompts
 from .sampling import get_logprobs, get_samples
 from .steering import HookedTransformerWithSteering
@@ -105,7 +105,7 @@ class RLOOTrainer(RLHFTrainer):
             f"batch_size ({self.args.batch_size}) must equal number of prompts ({len(self.actor_prompts)})."
 
         # JSON sycophancy judge
-        self.local_json_judge = LocalVLLMJSONJudge(
+        self.judge = Judge(
             base_url=JUDGE_BASE_URL,
             model=JUDGE_MODEL,
             concurrency=self.args.judge_concurrency,
@@ -323,7 +323,7 @@ class RLOOTrainer(RLHFTrainer):
         all_user_prompts = self.judge_user_prompts * K
 
         syco_scores = asyncio.run(
-            self.local_json_judge.score_batch_syco(
+            self.judge.score_batch_syco(
                 system_prompt=self.judge_scorer_system_prompt,
                 user_prompts=all_user_prompts,
                 assistant_replies=all_continuations,
