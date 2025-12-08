@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from typing import Any, Dict
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -22,6 +23,12 @@ def _strip_jsonc(text: str) -> str:
     return text
 
 def load_raw_prompts(path: str = "prompts/raw_prompts.jsonc") -> list[str]:
+    raw = _resolve_path(path).read_text(encoding="utf-8")
+    cleaned = _strip_jsonc(raw)
+    return json.loads(cleaned)
+
+
+def load_jsonc(path: str) -> Dict[str, Any]:
     raw = _resolve_path(path).read_text(encoding="utf-8")
     cleaned = _strip_jsonc(raw)
     return json.loads(cleaned)

@@ -1,13 +1,16 @@
 import asyncio
+from pathlib import Path
 
 from .config import RAW_PROMPTS_PATH, RLOOArgs, accelerator
 from .plots import _maybe_plot_steering_csv, _maybe_plot_training_csv
 from .trainers_rloo import RLOOTrainer
-from .utils import load_raw_prompts
+from .utils import load_raw_prompts, load_jsonc
 
 
 if __name__ == "__main__":
     raw_prompts = load_raw_prompts(str(RAW_PROMPTS_PATH))
+    config_path = Path(__file__).resolve().parent / "configs" / "rloo_default.jsonc"
+    cfg_dict = load_jsonc(config_path)
 
     # Exact Llama 3.1 chat format (actor input; do NOT prepend BOS separately)
     formatted_prompts = [
@@ -17,50 +20,12 @@ if __name__ == "__main__":
         for p in raw_prompts
     ]
 
-    rloo_args = RLOOArgs(
-        use_wandb=False,
-        total_phases=15,
+    # Merge JSONC config with runtime-derived values
+    cfg_dict["batch_size"] = len(formatted_prompts)
+    cfg_dict["actor_prompts_inline"] = formatted_prompts
+    cfg_dict["judge_user_prompts_inline"] = raw_prompts
 
-        # batch = number of prompts
-        batch_size=len(formatted_prompts),  # must equal number of prompts
-        num_minibatches=3,               # keep as-is; you asked not to use this as a knob
-        batches_per_learning_phase=12,       # <-- your chosen OOM/stability knob
-
-        gen_len=120,
-        temperature=0.7,
-        top_k=None,
-        prepend_bos=False,
-
-        steering_layer_indices=None,       # all layers
-        steering_init_scale=0.2,
-
-        # Actor vs judge prompts
-        actor_prompts_inline=formatted_prompts,
-        judge_user_prompts_inline=raw_prompts,
-
-        # Multi-rollout
-        rollouts_per_phase=12,               # <-- 8 rollouts each phase
-
-        # Opt (stabilized)
-        base_lr=5e-4,
-        max_grad_norm=2.0,
-        # ent_coef=0.001,
-        # kl_coef=0.6,
-
-
-        use_adaptive_kl=True,       # or False
-        kl_target_nats=0.05,
-        kl_coef=0.6,                # initial
-        kl_coef_min=0.05,
-        kl_coef_max=3.0,
-        kl_up=1.05,
-        kl_down=0.97,
-
-        use_entropy_anneal=True,     # or False
-        ent_coef_start=0.005,
-        ent_coef_end=0.0,
-        ent_warmup_phases=2,
-    )    
+    rloo_args = RLOOArgs(**cfg_dict)
 
     trainer = RLOOTrainer(rloo_args)
     

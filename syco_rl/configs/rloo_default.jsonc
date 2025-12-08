@@ -1,0 +1,43 @@
+{
+  // Training schedule
+  "use_wandb": false,
+  "total_phases": 15,
+
+  // Batch sizing
+  "batch_size": null, 
+  // will be set to len(prompts) at runtime
+  "num_minibatches": 3,
+  "batches_per_learning_phase": 12,
+
+  // Generation
+  "gen_len": 120,
+  "temperature": 0.7,
+  "top_k": null,
+  "prepend_bos": false,
+
+  // Steering
+  "steering_layer_indices": null,
+  "steering_init_scale": 0.2,
+
+  // Multi-rollout
+  "rollouts_per_phase": 12,
+
+  // Optimization
+  "base_lr": 5e-4,
+  "max_grad_norm": 2.0,
+
+  // KL / entropy controls
+  "use_adaptive_kl": true,
+  "kl_target_nats": 0.05,
+  "kl_coef": 0.6,
+  "kl_coef_min": 0.05,
+  "kl_coef_max": 3.0,
+  "kl_up": 1.05,
+  "kl_down": 0.97,
+
+  "use_entropy_anneal": true,
+  "ent_coef_start": 0.005,
+  "ent_coef_end": 0.0,
+  "ent_warmup_phases": 2
+}
+
